@@ -1686,6 +1686,44 @@ void init_disassembler() {
 }
 
 // -----------------------------------------------------------------
+// --------------------------- ASSEMBLER ---------------------------
+// -----------------------------------------------------------------
+
+uint64_t is_character_in_assembly_word();
+uint64_t digit_value(char c);
+void     get_assembly_symbol();
+void     get_required_assembly_symbol(uint64_t required, char* message);
+
+uint64_t lookup_mnemonic(char* mnemonic);
+uint64_t is_r_format_instruction(uint64_t ins);
+
+uint64_t parse_register();
+uint64_t parse_immediate();
+void     parse_memory_operand();
+void     parse_instruction();
+void     parse_data_word();
+
+void selfie_assemble();
+
+// ------------------------ GLOBAL CONSTANTS -----------------------
+
+uint64_t ASM_EOF     = 0;
+uint64_t ASM_WORD    = 1; // mnemonic, register name or directive like .8byte
+uint64_t ASM_INTEGER = 2;
+uint64_t ASM_COMMA   = 3;
+uint64_t ASM_LPAREN  = 4;
+uint64_t ASM_RPAREN  = 5;
+
+// ------------------------ GLOBAL VARIABLES -----------------------
+
+uint64_t asm_symbol  = 0;
+char*    asm_word    = (char*) 0;
+uint64_t asm_literal = 0;
+
+uint64_t number_of_parsed_instructions = 0;
+uint64_t number_of_parsed_data_words   = 0;
+
+// -----------------------------------------------------------------
 // -------------------------- REPLAY ENGINE ------------------------
 // -----------------------------------------------------------------
 
@@ -9720,6 +9758,344 @@ void selfie_disassemble(uint64_t verbose) {
 }
 
 // -----------------------------------------------------------------
+// --------------------------- ASSEMBLER ---------------------------
+// -----------------------------------------------------------------
+
+uint64_t is_character_in_assembly_word() {
+  if (is_character_letter_or_digit_or_underscore())
+    return 1;
+  else if (character == CHAR_DOT)
+    return 1;
+  else
+    return 0;
+}
+
+uint64_t digit_value(char c) {
+  // returns 16 if c is not a hexadecimal digit
+  if (is_digit(c))
+    return c - '0';
+  else if (c >= 'a') {
+    if (c <= 'f')
+      return c - 'a' + 10;
+  } else if (c >= 'A') {
+    if (c <= 'F')
+      return c - 'A' + 10;
+  }
+
+  return 16;
+}
+
+void get_assembly_symbol() {
+  uint64_t i;
+  uint64_t base;
+  uint64_t negative;
+
+  asm_symbol  = ASM_EOF;
+  asm_word    = (char*) 0;
+  asm_literal = 0;
+
+  if (find_next_character() == CHAR_EOF)
+    return;
+
+  negative = 0;
+
+  if (character == CHAR_DASH) {
+    negative = 1;
+
+    get_character();
+
+    if (not(is_digit(character))) {
+      syntax_error_message("digit expected after '-'");
+
+      exit(EXITCODE_SCANNERERROR);
+    }
+  }
+
+  if (is_digit(character)) {
+    base = 10;
+
+    if (character == '0') {
+      get_character();
+
+      if (character == 'x') {
+        get_character();
+
+        base = 16;
+      }
+    }
+
+    while (digit_value(character) < base) {
+      asm_literal = asm_literal * base + digit_value(character);
+
+      get_character();
+    }
+
+    if (negative)
+      asm_literal = -asm_literal;
+
+    asm_symbol = ASM_INTEGER;
+  } else if (is_character_in_assembly_word()) {
+    asm_word = string_alloc(MAX_IDENTIFIER_LENGTH);
+
+    i = 0;
+
+    while (is_character_in_assembly_word()) {
+      if (i >= MAX_IDENTIFIER_LENGTH) {
+        syntax_error_message("assembly word too long");
+
+        exit(EXITCODE_SCANNERERROR);
+      }
+
+      store_character(asm_word, i, character);
+
+      i = i + 1;
+
+      get_character();
+    }
+
+    store_character(asm_word, i, 0);
+
+    asm_symbol = ASM_WORD;
+  } else if (character == CHAR_COMMA) {
+    get_character();
+
+    asm_symbol = ASM_COMMA;
+  } else if (character == CHAR_LPARENTHESIS) {
+    get_character();
+
+    asm_symbol = ASM_LPAREN;
+  } else if (character == CHAR_RPARENTHESIS) {
+    get_character();
+
+    asm_symbol = ASM_RPAREN;
+  } else {
+    print_line_number("syntax error", line_number);
+    printf("found unknown character ");
+    print_character(character);
+    println();
+
+    number_of_syntax_errors = number_of_syntax_errors + 1;
+
+    exit(EXITCODE_SCANNERERROR);
+  }
+}
+
+void get_required_assembly_symbol(uint64_t required, char* message) {
+  if (asm_symbol == required) {
+    get_assembly_symbol();
+
+    return;
+  }
+
+  syntax_error_message(message);
+
+  exit(EXITCODE_PARSERERROR);
+}
+
+uint64_t lookup_mnemonic(char* mnemonic) {
+  uint64_t ins;
+
+  ins = LUI;
+
+  while (ins <= ECALL) {
+    if (string_compare(mnemonic, get_mnemonic(ins)))
+      return ins;
+
+    ins = ins + 1;
+  }
+
+  return 0;
+}
+
+uint64_t is_r_format_instruction(uint64_t ins) {
+  // ADD, SUB, MUL, DIVU, REMU, SLTU are consecutive
+  if (ins >= ADD)
+    if (ins <= SLTU)
+      return 1;
+
+  return 0;
+}
+
+uint64_t parse_register() {
+  uint64_t reg;
+
+  if (asm_symbol == ASM_WORD) {
+    reg = 0;
+
+    while (reg < NUMBEROFREGISTERS) {
+      if (string_compare(asm_word, get_register_name(reg))) {
+        get_assembly_symbol();
+
+        return reg;
+      }
+
+      reg = reg + 1;
+    }
+  }
+
+  syntax_error_message("register expected");
+
+  exit(EXITCODE_PARSERERROR);
+}
+
+uint64_t parse_immediate() {
+  uint64_t value;
+
+  if (asm_symbol == ASM_INTEGER) {
+    value = asm_literal;
+
+    get_assembly_symbol();
+
+    return value;
+  }
+
+  syntax_error_message("immediate expected");
+
+  exit(EXITCODE_PARSERERROR);
+}
+
+void parse_memory_operand() {
+  // imm(rs1)
+  imm = parse_immediate();
+
+  get_required_assembly_symbol(ASM_LPAREN, "'(' expected");
+
+  rs1 = parse_register();
+
+  get_required_assembly_symbol(ASM_RPAREN, "')' expected");
+}
+
+void parse_instruction() {
+  // result is stored in is, rd, rs1, rs2, imm, just like decode() does
+  is  = lookup_mnemonic(asm_word);
+  rd  = REG_ZR;
+  rs1 = REG_ZR;
+  rs2 = REG_ZR;
+  imm = 0;
+
+  if (is == 0) {
+    if (string_compare(asm_word, "nop")) {
+      // nop is addi zero,zero,0 and has no operands
+      is = ADDI;
+
+      get_assembly_symbol();
+
+      number_of_parsed_instructions = number_of_parsed_instructions + 1;
+
+      return;
+    }
+
+    syntax_error_message("unknown mnemonic");
+
+    exit(EXITCODE_PARSERERROR);
+  }
+
+  get_assembly_symbol();
+
+  if (is == LUI) {
+    rd = parse_register();
+    get_required_assembly_symbol(ASM_COMMA, "',' expected");
+    imm = parse_immediate();
+  } else if (is == ADDI) {
+    rd = parse_register();
+    get_required_assembly_symbol(ASM_COMMA, "',' expected");
+    rs1 = parse_register();
+    get_required_assembly_symbol(ASM_COMMA, "',' expected");
+    imm = parse_immediate();
+  } else if (is_r_format_instruction(is)) {
+    rd = parse_register();
+    get_required_assembly_symbol(ASM_COMMA, "',' expected");
+    rs1 = parse_register();
+    get_required_assembly_symbol(ASM_COMMA, "',' expected");
+    rs2 = parse_register();
+  } else if (is == LOAD) {
+    rd = parse_register();
+    get_required_assembly_symbol(ASM_COMMA, "',' expected");
+    parse_memory_operand();
+  } else if (is == STORE) {
+    rs2 = parse_register();
+    get_required_assembly_symbol(ASM_COMMA, "',' expected");
+    parse_memory_operand();
+  } else if (is == BEQ) {
+    rs1 = parse_register();
+    get_required_assembly_symbol(ASM_COMMA, "',' expected");
+    rs2 = parse_register();
+    get_required_assembly_symbol(ASM_COMMA, "',' expected");
+    // text shows instructions, encoders need bytes
+    imm = parse_immediate() * INSTRUCTIONSIZE;
+  } else if (is == JAL) {
+    rd = parse_register();
+    get_required_assembly_symbol(ASM_COMMA, "',' expected");
+    imm = parse_immediate() * INSTRUCTIONSIZE;
+  } else if (is == JALR) {
+    rd = parse_register();
+    get_required_assembly_symbol(ASM_COMMA, "',' expected");
+    parse_memory_operand();
+    imm = imm * INSTRUCTIONSIZE;
+  }
+  // ecall has no operands
+
+  number_of_parsed_instructions = number_of_parsed_instructions + 1;
+}
+
+void parse_data_word() {
+  // .8byte 0x... (or .4byte on 32-bit targets)
+  get_assembly_symbol();
+
+  if (asm_symbol != ASM_INTEGER) {
+    syntax_error_message("data word expected");
+
+    exit(EXITCODE_PARSERERROR);
+  }
+
+  get_assembly_symbol();
+
+  number_of_parsed_data_words = number_of_parsed_data_words + 1;
+}
+
+void selfie_assemble() {
+  assembly_name = get_argument();
+
+  // print_line_number reports source_name and line_number
+  source_name = assembly_name;
+
+  source_fd = open_read_only(assembly_name);
+
+  if (signed_less_than(source_fd, 0)) {
+    printf("%s: could not open assembly input file %s\n", selfie_name, assembly_name);
+
+    exit(EXITCODE_IOERROR);
+  }
+
+  number_of_parsed_instructions = 0;
+  number_of_parsed_data_words   = 0;
+
+  reset_scanner();
+
+  get_assembly_symbol();
+
+  while (asm_symbol != ASM_EOF) {
+    if (asm_symbol == ASM_WORD) {
+      if (string_compare(asm_word, ".8byte"))
+        parse_data_word();
+      else if (string_compare(asm_word, ".4byte"))
+        parse_data_word();
+      else
+        parse_instruction();
+    } else {
+      syntax_error_message("mnemonic expected");
+
+      exit(EXITCODE_PARSERERROR);
+    }
+  }
+
+  printf("%s: %lu instructions and %lu data words parsed from %s\n", selfie_name,
+    number_of_parsed_instructions,
+    number_of_parsed_data_words,
+    assembly_name);
+}
+
+// -----------------------------------------------------------------
 // -------------------------- REPLAY ENGINE ------------------------
 // -----------------------------------------------------------------
 
@@ -12293,6 +12669,8 @@ uint64_t selfie(uint64_t extras) {
         selfie_disassemble(0);
       else if (string_compare(argument, "-S"))
         selfie_disassemble(1);
+      else if (string_compare(argument, "-a"))
+        selfie_assemble();
       else if (string_compare(argument, "-l"))
         selfie_load(get_argument());
       else if (not(extras)) {
