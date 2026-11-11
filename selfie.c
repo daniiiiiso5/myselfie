@@ -9980,6 +9980,8 @@ void parse_instruction() {
 
       get_assembly_symbol();
 
+      emit_addi(REG_ZR, REG_ZR, 0);
+
       number_of_parsed_instructions = number_of_parsed_instructions + 1;
 
       return;
@@ -9995,7 +9997,8 @@ void parse_instruction() {
   if (is == LUI) {
     rd = parse_register();
     get_required_assembly_symbol(ASM_COMMA, "',' expected");
-    imm = parse_immediate();
+    // disassembler prints sign_shrink(imm, 20) in hex; restore signed 20-bit value
+    imm = sign_extend(sign_shrink(parse_immediate(), 20), 20);
   } else if (is == ADDI) {
     rd = parse_register();
     get_required_assembly_symbol(ASM_COMMA, "',' expected");
@@ -10035,9 +10038,43 @@ void parse_instruction() {
   }
   // ecall has no operands
 
+  // generate binary code for the parsed instruction
+  if (is == LUI)
+    emit_lui(rd, imm);
+  else if (is == ADDI)
+    emit_addi(rd, rs1, imm);
+  else if (is == ADD)
+    emit_add(rd, rs1, rs2);
+  else if (is == SUB)
+    emit_sub(rd, rs1, rs2);
+  else if (is == MUL)
+    emit_mul(rd, rs1, rs2);
+  else if (is == DIVU)
+    emit_divu(rd, rs1, rs2);
+  else if (is == REMU)
+    emit_remu(rd, rs1, rs2);
+  else if (is == SLTU)
+    emit_sltu(rd, rs1, rs2);
+  else if (is == LOAD)
+    emit_load(rd, rs1, imm);
+  else if (is == STORE)
+    emit_store(rs1, imm, rs2);
+  else if (is == BEQ)
+    emit_beq(rs1, rs2, imm);
+  else if (is == JAL)
+    emit_jal(rd, imm);
+  else if (is == JALR)
+    emit_jalr(rd, rs1, imm);
+  else if (is == ECALL)
+    emit_ecall();
+  else {
+    syntax_error_message("unsupported mnemonic");
+
+    exit(EXITCODE_PARSERERROR);
+  }
+
   number_of_parsed_instructions = number_of_parsed_instructions + 1;
 }
-
 void parse_data_word() {
   // .8byte 0x... (or .4byte on 32-bit targets)
   get_assembly_symbol();
@@ -10047,6 +10084,14 @@ void parse_data_word() {
 
     exit(EXITCODE_PARSERERROR);
   }
+
+  // store data word sequentially in data segment
+  store_data(data_size, asm_literal);
+
+  if (data_line_number != (uint64_t*) 0)
+    *(data_line_number + data_size / WORDSIZE) = line_number;
+
+  data_size = data_size + WORDSIZE;
 
   get_assembly_symbol();
 
@@ -10058,6 +10103,7 @@ void selfie_assemble() {
 
   // print_line_number reports source_name and line_number
   source_name = assembly_name;
+  binary_name = assembly_name;
 
   source_fd = open_read_only(assembly_name);
 
@@ -10069,6 +10115,19 @@ void selfie_assemble() {
 
   number_of_parsed_instructions = 0;
   number_of_parsed_data_words   = 0;
+
+  // prepare binary like the compiler does
+  reset_binary();
+  reset_binary_counters();
+
+  code_binary = zmalloc(MAX_CODE_SIZE);
+  data_binary = zmalloc(MAX_DATA_SIZE);
+
+  code_line_number = zmalloc(MAX_CODE_SIZE / INSTRUCTIONSIZE * sizeof(uint64_t));
+  data_line_number = zmalloc(MAX_DATA_SIZE / WORDSIZE * sizeof(uint64_t));
+
+  // RISC-U code starts at the same address as compiler-generated binaries
+  code_start = PK_CODE_START;
 
   reset_scanner();
 
@@ -10089,12 +10148,20 @@ void selfie_assemble() {
     }
   }
 
+  // data segment is placed page-aligned after the code segment
+  data_start = round_up(code_start + code_size, PAGESIZE);
+
   printf("%s: %lu instructions and %lu data words parsed from %s\n", selfie_name,
     number_of_parsed_instructions,
     number_of_parsed_data_words,
     assembly_name);
-}
 
+  printf("%s: vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv\n", selfie_name);
+  printf("%s: %lu bytes generated with %lu instructions and %lu bytes of data\n", selfie_name,
+    code_size + data_size,
+    code_size / INSTRUCTIONSIZE,
+    data_size);
+}
 // -----------------------------------------------------------------
 // -------------------------- REPLAY ENGINE ------------------------
 // -----------------------------------------------------------------
