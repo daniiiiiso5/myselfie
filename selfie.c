@@ -2439,11 +2439,20 @@ uint64_t minmob(uint64_t* to_context);
 uint64_t minster(uint64_t* to_context);
 uint64_t mobster(uint64_t* to_context);
 
+void      create_processes();
+uint64_t  process_index(uint64_t* context);
+uint64_t* schedule_process(uint64_t* from_context, uint64_t terminated);
+
+uint64_t selfie_run_processes(uint64_t machine);
+
 uint64_t selfie_run(uint64_t machine);
 
 // ------------------------ GLOBAL CONSTANTS -----------------------
 
 uint64_t* MY_CONTEXT = (uint64_t*) 0;
+uint64_t* processes = (uint64_t*) 0; // table of process contexts, 0 marks a terminated process
+uint64_t number_of_processes = 1;    // set by -x n and -z n
+uint64_t processes_exit_code = 0;    // first non-zero exit code of a terminated process
 
 uint64_t DONOTEXIT = 0;
 uint64_t EXIT      = 1; // extended in symbolic execution engine
@@ -12275,8 +12284,9 @@ void boot_loader(uint64_t* context) {
 
   set_name(context, increment_boot_level_prefix(selfie_name, binary_name));
 
-  // pass binary name as first argument by replacing next argument
-  set_argument(get_name(context));
+  if (number_of_remaining_arguments() > 0)
+    // pass binary name as first argument by replacing next argument
+    set_argument(get_name(context));
 
   up_load_arguments(context, number_of_remaining_arguments(), remaining_arguments());
 }
@@ -12393,9 +12403,82 @@ uint64_t handle_exception(uint64_t* context) {
   }
 }
 
+void create_processes() {
+  uint64_t i;
+
+  processes = smalloc(number_of_processes * sizeof(uint64_t*));
+
+  processes_exit_code = EXITCODE_NOERROR;
+
+  i = 0;
+
+  while (i < number_of_processes) {
+    current_context = create_context(MY_CONTEXT, 0);
+
+    boot_loader(current_context);
+
+    *(processes + i) = (uint64_t) current_context;
+
+    i = i + 1;
+  }
+
+  // first process runs first
+  current_context = (uint64_t*) *processes;
+}
+
+uint64_t process_index(uint64_t* context) {
+  uint64_t i;
+
+  i = 0;
+
+  while (i < number_of_processes) {
+    if (*(processes + i) == (uint64_t) context)
+      return i;
+
+    i = i + 1;
+  }
+
+  return number_of_processes;
+}
+
+uint64_t* schedule_process(uint64_t* from_context, uint64_t terminated) {
+  uint64_t index;
+  uint64_t i;
+
+  index = process_index(from_context);
+
+  if (terminated) {
+    if (processes_exit_code == EXITCODE_NOERROR)
+      processes_exit_code = get_exit_code(from_context);
+
+    if (index < number_of_processes)
+      *(processes + index) = 0;
+  }
+
+  // round robin: next running process after from_context,
+  // from_context itself is the last candidate
+  i = 0;
+
+  while (i < number_of_processes) {
+    index = index + 1;
+
+    if (index >= number_of_processes)
+      index = 0;
+
+    if (*(processes + index) != 0)
+      return (uint64_t*) *(processes + index);
+
+    i = i + 1;
+  }
+
+  // no process left
+  return (uint64_t*) 0;
+}
+
 uint64_t mipster(uint64_t* to_context) {
   uint64_t timeout;
   uint64_t* from_context;
+  uint64_t terminated;
 
   timeout = TIMESLICE;
 
@@ -12407,11 +12490,13 @@ uint64_t mipster(uint64_t* to_context) {
       to_context = get_parent(from_context);
 
       timeout = TIMEROFF;
-    } else if (handle_exception(from_context) == EXIT)
-      return get_exit_code(from_context);
-    else {
-      // TODO: scheduler should go here
-      to_context = from_context;
+    } else {
+      terminated = handle_exception(from_context) == EXIT;
+
+      to_context = schedule_process(from_context, terminated);
+
+      if (to_context == (uint64_t*) 0)
+        return processes_exit_code;
 
       timeout = TIMESLICE;
     }
@@ -12420,15 +12505,17 @@ uint64_t mipster(uint64_t* to_context) {
 
 uint64_t hypster(uint64_t* to_context) {
   uint64_t* from_context;
+  uint64_t terminated;
 
   while (1) {
     from_context = hypster_switch(to_context, TIMESLICE);
 
-    if (handle_exception(from_context) == EXIT)
-      return get_exit_code(from_context);
-    else
-      // TODO: scheduler should go here
-      to_context = from_context;
+    terminated = handle_exception(from_context) == EXIT;
+
+    to_context = schedule_process(from_context, terminated);
+
+    if (to_context == (uint64_t*) 0)
+      return processes_exit_code;
   }
 }
 
@@ -12539,6 +12626,7 @@ uint64_t mobster(uint64_t* to_context) {
 
 uint64_t selfie_run(uint64_t machine) {
   uint64_t exit_code;
+  uint64_t i;
 
   if (code_size == 0) {
     printf("%s: nothing to run, debug, or host\n", selfie_name);
@@ -12574,13 +12662,15 @@ uint64_t selfie_run(uint64_t machine) {
   reset_profiler();
   reset_microkernel();
 
-  init_memory(atoi(peek_argument(0)));
+    if (number_of_remaining_arguments() > 0)
+    init_memory(atoi(peek_argument(0)));
+  else
+    // no memory size given, e.g., for -x n and -z n
+    init_memory(64);
 
-  current_context = create_context(MY_CONTEXT, 0);
+    // assert: number_of_remaining_arguments() > 0
 
-  // assert: number_of_remaining_arguments() > 0
-
-  boot_loader(current_context);
+  create_processes();
 
   // current_context is ready to run
 
@@ -12593,8 +12683,14 @@ uint64_t selfie_run(uint64_t machine) {
     binary_name,
     PHYSICALMEMORYSIZE / MEGABYTE);
 
-  if (GC_ON) {
-    gc_init(current_context);
+    if (GC_ON) {
+    i = 0;
+
+    while (i < number_of_processes) {
+      gc_init((uint64_t*) *(processes + i));
+
+      i = i + 1;
+    }
 
     printf(", gcing every %lu mallocs, ", GC_PERIOD);
     if (GC_REUSE) printf("reusing memory"); else printf("not reusing memory");
@@ -12699,6 +12795,17 @@ void print_synopsis(char* extras) {
 // ----------------------------- SELFIE ----------------------------
 // -----------------------------------------------------------------
 
+uint64_t selfie_run_processes(uint64_t machine) {
+  // -x n and -z n: n is the number of processes,
+  // memory size and program arguments are optional
+  number_of_processes = atoi(get_argument());
+
+  if (number_of_processes == 0)
+    return EXITCODE_BADARGUMENTS;
+
+  return selfie_run(machine);
+}
+
 uint64_t selfie(uint64_t extras) {
   if (number_of_remaining_arguments() == 0)
     return EXITCODE_NOARGUMENTS;
@@ -12753,6 +12860,12 @@ uint64_t selfie(uint64_t extras) {
           return selfie_run(MINSTER);
         else if (string_compare(argument, "-mob"))
           return selfie_run(MOBSTER);
+        else if (string_compare(argument, "-L1"))
+          return selfie_run(CAPSTER);
+                else if (string_compare(argument, "-x"))
+          return selfie_run_processes(MIPSTER);
+        else if (string_compare(argument, "-z"))
+          return selfie_run_processes(HYPSTER);
         else if (string_compare(argument, "-L1"))
           return selfie_run(CAPSTER);
         else
